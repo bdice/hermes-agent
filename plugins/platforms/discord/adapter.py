@@ -3714,6 +3714,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             logger.info(
                 "Auto-follow %s -> VC %s (text bind %s): %s",
                 member.display_name, channel.name, text_ch_id, result or "joined")
+            # The join came from a voice-state event, not an interaction, so the runner
+            # has no channel to post its join confirmation through — say something here.
+            if result:
+                try:
+                    await channel.send(f"🎙️ Followed you in — go ahead and talk, {member.mention}.")
+                except Exception:
+                    logger.debug("auto-follow announcement failed", exc_info=True)
         except Exception as e:
             logger.warning("Voice auto-follow failed: %s", e)
 

@@ -52,6 +52,9 @@ class GatewayVoiceMixin:
 
     def _bind_voice_input_callback(self, adapter) -> None:
         """Route voice transcripts back through the adapter that captured them."""
+        logger.info(
+            "Voice auto-follow wiring installed on adapter (name=%s)",
+            getattr(adapter, "name", "?"))
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
@@ -82,8 +85,21 @@ class GatewayVoiceMixin:
             if getattr(source, "platform", None) != Platform.DISCORD:
                 return
             if getattr(source, "chat_type", None) == "dm" or not getattr(source, "guild_id", None):
+                logger.info(
+                    "Voice auto-follow NOT armed: chat_type=%s guild_id=%s platform=%s",
+                    getattr(source, "chat_type", None),
+                    getattr(source, "guild_id", None),
+                    getattr(source, "platform", None))
                 return
-            adapter = self.adapters.get(Platform.DISCORD)  # type: ignore[attr-defined]
+            adapters = getattr(self, "adapters", {}) or {}
+            adapter = adapters.get(Platform.DISCORD)
+            # Multiplexed gateways key platform adapters by profile; take the single
+            # Discord entry if the enum key misses.
+            if adapter is None:
+                discord_adapters = [a for plat, a in adapters.items()
+                                    if getattr(a, "name", "").lower().startswith("discord")]
+                if len(discord_adapters) == 1:
+                    adapter = discord_adapters[0]
             if adapter is None or not getattr(adapter, "_voice_auto_follow_enabled", lambda *_a: False)(
                     int(source.chat_id)):
                 return

@@ -1568,11 +1568,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 # Auto-follow runs before the bot-in-channel gate: the whole point is to
                 # join when the bot is NOT yet connected.
                 joined = before.channel is None and after.channel is not None
-                switched = (before.channel is not None and after.channel is not None
-                            and before.channel != after.channel)
-                if (joined or switched) and after.channel is not None and (
-                        adapter_self._voice_auto_follow_enabled()
-                        or adapter_self._voice_auto_follow_enabled(after.channel.id)):
+                # Follow only the designated voice channel(s): never other channels,
+                # never channel-to-channel moves.
+                if joined and after.channel is not None and (
+                        adapter_self._voice_auto_follow_enabled(after.channel.id)):
                     asyncio.ensure_future(adapter_self._maybe_auto_follow_voice(member, after.channel))
                 if (before.channel is not None and after.channel is None
                         and adapter_self._voice_follow_mode_getter is not None):
@@ -3697,16 +3696,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 return
             vc = self._voice_clients.get(guild_id)
             if vc is not None and vc.is_connected():
-                if getattr(vc, "channel", None) is not None and vc.channel.id != channel.id:
-                    # Shadow them across channels: move to wherever they went.
-                    await vc.move_to(channel)
-                    self._reset_voice_timeout(guild_id)
-                    self._voice_following[(guild_id, member.id)] = channel.id
-                    logger.info("Auto-follow moved %s -> VC %s", member.display_name, channel.name)
-                else:
+                if getattr(vc, "channel", None) is not None and vc.channel.id == channel.id:
                     self._voice_following[(guild_id, member.id)] = channel.id
                     logger.info(
                         "Auto-follow: already in VC %s (guild %s)", channel.name, guild_id)
+                else:
+                    logger.info(
+                        "Auto-follow skipped: bot connected in another channel; not moving")
                 return
             vc_named = self._voice_auto_follow_enabled(channel.id)
             text_ch_id = getattr(self, "_voice_auto_follow_bound", {}).get(guild_id)

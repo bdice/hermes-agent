@@ -55,6 +55,48 @@ class GatewayVoiceMixin:
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
+        if hasattr(adapter, "_voice_autofollow_join"):
+            adapter._voice_autofollow_join = functools.partial(
+                self._handle_voice_autofollow_join, adapter=adapter)
+
+    async def _handle_voice_autofollow_join(self, channel, text_channel_id: int, *, adapter):
+        """Auto-follow entry from the Discord adapter: a VC join by an authorized member
+        pulls the bot in, with replies bound to their last text channel."""
+        guild = getattr(channel, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        bound = getattr(adapter, "_voice_auto_follow_bound", {}).get(guild_id)
+        if bound is None or int(bound) != int(text_channel_id):
+            return ""
+        user_id = getattr(adapter, "_voice_auto_follow_user_id", {}).get(guild_id)
+        if not user_id:
+            return ""
+        source = adapter.build_source(
+            chat_id=str(text_channel_id), chat_type="group",
+            user_id=user_id, guild_id=str(guild_id))
+        return await self._join_voice_channel_for_source(source, guild_id)
+
+    def _remember_voice_autofollow_source(self, source) -> None:
+        """Arm auto-follow per guild from an authorized text message: remember the channel
+        and user so a later VC join can bind replies without guessing a destination."""
+        try:
+            if getattr(source, "platform", None) != Platform.DISCORD:
+                return
+            if getattr(source, "chat_type", None) == "dm" or not getattr(source, "guild_id", None):
+                return
+            adapter = self.adapters.get(Platform.DISCORD)  # type: ignore[attr-defined]
+            if adapter is None or not getattr(adapter, "_voice_auto_follow_enabled", lambda: False)():
+                return
+            guild_id = int(source.guild_id)
+            # Only arm the lane the user actually uses for voice: their last channel in the
+            # guild wins, and the join below must match it exactly.
+            if not hasattr(adapter, "_voice_auto_follow_bound"):
+                return
+            adapter._voice_auto_follow_bound[guild_id] = int(source.chat_id)
+            if not hasattr(adapter, "_voice_auto_follow_user_id"):
+                adapter._voice_auto_follow_user_id = {}
+            adapter._voice_auto_follow_user_id[guild_id] = str(source.user_id)
+        except Exception:
+            logger.debug("voice auto-follow arm failed", exc_info=True)
 
     def _load_voice_modes(self) -> dict[str, str]:
         try:
@@ -146,18 +188,28 @@ class GatewayVoiceMixin:
         return raw.guild.id if getattr(raw, "guild", None) else None  # regular message
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
-        adapter = self._delivery_adapter_for(event.source)
-        if not hasattr(adapter, "join_voice_channel"):
+        result = await self._join_voice_channel_for_source(
+            event.source, self._get_guild_id(event))
+        return result
+
+    async def _join_voice_channel_for_source(
+        self, source: SessionSource, guild_id: Optional[int]
+    ) -> str:
+        """Join the voice channel the user identified by ``source`` is sitting in, and bind
+        replies to ``source.chat_id``. Shared by ``/voice join`` and auto-follow."""
+        if source.platform != Platform.DISCORD:
             return t("gateway.voice.channel_unsupported")
-        guild_id = self._get_guild_id(event)
+        adapter = self._delivery_adapter_for(source)  # type: ignore[attr-defined]
+        if adapter is None or not hasattr(adapter, "join_voice_channel"):
+            return t("gateway.voice.channel_unsupported")
         if not guild_id:
             return t("gateway.voice.channel_guild_only")
-        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
+        voice_channel = await adapter.get_user_voice_channel(guild_id, source.user_id)
         if not voice_channel:
             return t("gateway.voice.channel_not_in_voice")
         # Wire callbacks BEFORE join so voice input arriving right after connection is not lost.
         self._bind_voice_input_callback(adapter)
-        voice_profile = self._adapter_profile_for_source(event.source)
+        voice_profile = self._adapter_profile_for_source(source)  # type: ignore[attr-defined]
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = functools.partial(
                 self._handle_voice_timeout_cleanup, adapter=adapter)
@@ -177,7 +229,7 @@ class GatewayVoiceMixin:
         if not success:
             adapter._voice_input_callback = None
             return t("gateway.voice.channel_join_permissions")
-        text_channel_id = int(event.source.chat_id)
+        text_channel_id = int(source.chat_id)
         # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
         # keeps it); nothing awaits between this and the binding write, so no poll sees the gap.
         previous = adapter._voice_text_channels.get(guild_id)
@@ -185,9 +237,9 @@ class GatewayVoiceMixin:
             adapter.discard_pending_voice_input(guild_id)
         adapter._voice_text_channels[guild_id] = text_channel_id
         if hasattr(adapter, "_voice_sources"):
-            adapter._voice_sources[guild_id] = event.source.to_dict()
-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
-                               event.source.chat_id, "all")
+            adapter._voice_sources[guild_id] = source.to_dict()
+        self._apply_voice_mode(adapter, self._voice_key_for_source(source),
+                               source.chat_id, "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:

@@ -1275,6 +1275,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._voice_receivers: dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        self._voice_auto_follow_bound: dict[int, int] = {}  # guild_id -> last authorized text channel
+        self._voice_auto_follow_user_id: dict[int, str] = {}  # guild_id -> that user's id
+        self._voice_autofollow_join: Optional[Callable] = None  # set by run_voice.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
         # the inactivity timer keeps the bot in channel for /voice off, unlike /voice leave.
@@ -1558,6 +1561,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                # Auto-follow runs before the bot-in-channel gate: the whole point is to
+                # join when the bot is NOT yet connected.
+                joined = before.channel is None and after.channel is not None
+                if joined and adapter_self._voice_auto_follow_enabled():
+                    asyncio.ensure_future(adapter_self._maybe_auto_follow_voice(member, after.channel))
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return
@@ -1566,7 +1574,6 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     return
                 if member == adapter_self._client.user:
                     return
-                joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
                 switched = (
                     before.channel is not None
@@ -3634,6 +3641,53 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         return self._load_discord_int_config(
             "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT, minimum=0,
         )
+
+    def _voice_auto_follow_enabled(self) -> bool:
+        """discord.voice_auto_follow: join a VC automatically when an authorized member joins."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            return bool((cfg.get("discord") or {}).get("voice_auto_follow", False))
+        except Exception:
+            return False
+
+    async def _maybe_auto_follow_voice(self, member, channel) -> None:
+        """Auto-join the voice channel an authorized member just entered, binding replies
+        to the last text channel they spoke in. Opt-in via discord.voice_auto_follow."""
+        try:
+            guild_id = channel.guild.id
+            if member.bot or not self._is_allowed_user(str(member.id), guild=channel.guild, is_dm=False):
+                return
+            if not getattr(self, "_voice_autofollow_join", None):
+                # Runner wiring not installed yet; nothing safe to bind replies to.
+                return
+            vc = self._voice_clients.get(guild_id)
+            if vc is not None and vc.is_connected():
+                if getattr(vc, "channel", None) is not None and vc.channel.id != channel.id:
+                    await vc.move_to(channel)
+                    self._reset_voice_timeout(guild_id)
+                return
+            text_ch_id = getattr(self, "_voice_auto_follow_bound", {}).get(guild_id)
+            if text_ch_id is None:
+                # No text-channel binding for this guild: never guess a reply destination.
+                # The user's first typed message in a channel arms auto-follow for it.
+                return
+            result = await self._voice_join_handler(channel, text_ch_id)
+            if result:
+                logger.info("Auto-followed %s into voice channel %s", member.display_name, channel.name)
+        except Exception as e:
+            logger.warning("Voice auto-follow failed: %s", e)
+
+    async def _voice_join_handler(self, channel, text_channel_id: int):
+        """Delegate an auto-follow join to the runner wiring installed by run_voice.py."""
+        handler = getattr(self, "_voice_autofollow_join", None)
+        if handler is None:
+            return None
+        return await handler(channel, text_channel_id)
+
+    def _remember_auto_follow_binding(self, guild_id: int, text_channel_id: int) -> None:
+        """Track the text channel an authorized user last spoke in, for auto-follow joins."""
+        self._voice_auto_follow_bound[guild_id] = text_channel_id
 
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""

@@ -3714,13 +3714,22 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             logger.info(
                 "Auto-follow attempt: user=%d vc=%s bound=%s",
                 member.id, channel.name, text_ch_id)
-            result = await self._voice_join_handler(channel, text_ch_id)
+            # Self-heal the wiring: a gateway whose wiring install raced has no handler.
+            if not getattr(self, "_voice_autofollow_join", None):
+                self._install_autofollow_wiring_fallback()
+            # Bind the reply routing through the runner (text channel + voice mode);
+            # the connection itself is established directly by this adapter below.
+            try:
+                await self._voice_join_handler(channel, text_ch_id)
+            except Exception as e:
+                logger.warning("Auto-follow runner binding failed: %s", e)
+            joined = await self.join_voice_channel(
+                channel, text_channel_id=int(text_ch_id))
+            receiver_live = guild_id in self._voice_receivers
             logger.info(
-                "Auto-follow %s -> VC %s (text bind %s): %s",
-                member.display_name, channel.name, text_ch_id, result or "joined")
-            # The join came from a voice-state event, not an interaction, so the runner
-            # has no channel to post its join confirmation through — say something here.
-            if result:
+                "Auto-follow %s -> VC %s (text bind %s): joined=%s receiver=%s",
+                member.display_name, channel.name, text_ch_id, joined, receiver_live)
+            if joined:
                 try:
                     await channel.send(f"🎙️ Followed you in — go ahead and talk, {member.mention}.")
                 except Exception:
@@ -3755,12 +3764,36 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             logger.debug("auto-follow home channel lookup failed", exc_info=True)
         return None
 
+    def _install_autofollow_wiring_fallback(self) -> None:
+        """Install the runner's auto-follow handler if it was never wired at startup.
+        Finds the live runner via the voice-input callback set by run_voice.py; falls
+        back to a plain adapter-level join so the bot at least follows audibly."""
+        cb = getattr(self, "_voice_input_callback", None)
+        runner = getattr(cb, "args", (None,))[0] if cb is not None else None
+        handler = getattr(runner, "_handle_voice_autofollow_join", None) if runner else None
+        if handler is not None:
+            import functools
+            self._voice_autofollow_join = functools.partial(handler, adapter=self)
+            logger.info("Auto-follow wiring installed via fallback (runner=%s)", type(runner).__name__)
+            return
+        async def _fallback_join(channel, text_channel_id: int):
+            # Adapter-only fallback: bind routing fields directly; no runner features.
+            self._bind_voice_text_channel(channel.guild.id, int(text_channel_id), None)
+            return "bound"
+        self._voice_autofollow_join = _fallback_join
+        logger.info("Auto-follow wiring installed via adapter-only fallback")
+
     async def _voice_join_handler(self, channel, text_channel_id: int):
         """Delegate an auto-follow join to the runner wiring installed by run_voice.py."""
         handler = getattr(self, "_voice_autofollow_join", None)
         if handler is None:
             return None
-        return await handler(channel, text_channel_id)
+        try:
+            return await handler(channel, int(text_channel_id))
+        except TypeError as e:
+            # Stale runner module (int/str guild-id mismatch) — name it, don't hide it.
+            logger.warning("Auto-follow join handler TypeError: %s", e, exc_info=True)
+            return None
 
     def _remember_auto_follow_binding(self, guild_id: int, text_channel_id: int) -> None:
         """Track the text channel an authorized user last spoke in, for auto-follow joins."""

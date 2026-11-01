@@ -76,7 +76,9 @@ class GatewayVoiceMixin:
         source = adapter.build_source(
             chat_id=str(text_channel_id), chat_type="group",
             user_id=user_id, guild_id=str(guild_id))
-        return await self._join_voice_channel_for_source(source, guild_id)
+        # guild_id stays int here; a str would make discord.py's id comparisons
+        # silently no-op the join/move.
+        return await self._join_voice_channel_for_source(source, int(guild_id))
 
     def _remember_voice_autofollow_source(self, source) -> None:
         """Arm auto-follow per guild from an authorized text message: remember the channel

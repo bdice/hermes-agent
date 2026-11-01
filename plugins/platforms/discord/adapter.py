@@ -4018,6 +4018,21 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
+                # Recovery: a connection can exist without a live receiver (an earlier
+                # join whose receiver start raised) — that state is deaf, so rebuild it.
+                if guild_id not in self._voice_receivers or guild_id not in self._voice_listen_tasks:
+                    logger.warning(
+                        "Voice join found a connection with no live receiver (guild=%s); restarting it",
+                        guild_id)
+                    try:
+                        receiver = VoiceReceiver(existing, allowed_user_ids=self._allowed_user_ids)
+                        receiver.start()
+                        self._voice_receivers[guild_id] = receiver
+                        self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+                            self._voice_listen_loop(guild_id)
+                        )
+                    except Exception as e:
+                        logger.warning("Voice receiver failed to start: %s", e)
                 return True
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc

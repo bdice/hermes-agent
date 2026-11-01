@@ -96,8 +96,11 @@ class GatewayVoiceMixin:
             if not hasattr(adapter, "_voice_auto_follow_user_id"):
                 adapter._voice_auto_follow_user_id = {}
             adapter._voice_auto_follow_user_id[guild_id] = str(source.user_id)
+            logger.info(
+                "Voice auto-follow armed: guild=%s channel=%s user=%s",
+                guild_id, source.chat_id, source.user_id)
         except Exception:
-            logger.debug("voice auto-follow arm failed", exc_info=True)
+            logger.warning("voice auto-follow arm failed", exc_info=True)
 
     def _load_voice_modes(self) -> dict[str, str]:
         try:

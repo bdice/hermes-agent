@@ -3722,9 +3722,98 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
         if vc.is_playing():
             vc.stop()
+        # discord.py only builds its opus Encoder inside play(); with libopus not yet
+        # loaded the construction raises inside the player thread and the stream dies
+        # silently. Load the codec explicitly so play() can never wedge that way.
+        if DISCORD_AVAILABLE and discord is not None and not discord.opus.is_loaded():
+            _load_opus_codec()
         vc.play(mixer, after=_after)
         self._voice_mixers[guild_id] = mixer
+        self._start_mixer_watchdog(guild_id, vc, mixer)
+        # discord.py gates a play session's first frame on the DAVE handshake finishing,
+        # but VoiceClient.connect() returns before that welcome arrives. A mixer played
+        # too early freezes its sender forever, so every later speech queues behind a
+        # frozen playback and times out silently. Re-play once the session is ready so
+        # the sender starts at a provably writable moment.
+        try:
+            can_encrypt = getattr(vc._connection, "can_encrypt", False)
+            dave_session = getattr(vc._connection, "dave_session", None)
+            if can_encrypt and dave_session is not None:
+                deadline = time.monotonic() + 5.0
+                while not dave_session.ready and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                if not dave_session.ready:
+                    logger.warning("DAVE session not ready before re-arm deadline (guild=%d)", guild_id)
+            if self._voice_mixers.get(guild_id) is mixer and vc.is_connected():
+                if vc.is_playing():
+                    vc.stop()
+                await asyncio.sleep(0.2)
+                if vc.is_connected():
+                    vc.play(mixer, after=_after)
+                    logger.info("Voice mixer re-armed after DAVE (guild=%d)", guild_id)
+        except Exception as e:
+            logger.debug("Mixer re-arm skipped (guild=%d): %s", guild_id, e)
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
+
+    def _start_mixer_watchdog(self, guild_id: int, vc, mixer) -> None:
+        """discord.py's AudioPlayer can wedge before its first frame when a play races the
+        DAVE handshake: is_playing() stays True forever and every queued speech times out
+        silently. Watch the player clock and re-play the mixer when it stops advancing."""
+        async def _watchdog() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(5.0)
+                    if self._voice_mixers.get(guild_id) is not mixer:
+                        return
+                    if not vc.is_connected():
+                        return
+                    player = getattr(vc, "_player", None)
+                    if player is None:
+                        if vc.is_connected():
+                            vc.play(mixer, after=lambda e: None)
+                            logger.warning("Voice mixer watchdog: player gone, re-played (guild=%d)", guild_id)
+                        continue
+                    if not player.is_playing():
+                        continue  # source ended; nothing to re-arm while stopped
+                    loops = getattr(player, "loops", 0)
+                    started = getattr(player, "_start", None)
+                    if started is None:
+                        # Player started but never entered its send loop (wedged before
+                        # the first frame — e.g. blocked waiting on DAVE). Age the thread.
+                        joined = getattr(player, "started_at", None)
+                        if joined is None:
+                            player.started_at = time.perf_counter()  # type: ignore[attr-defined]
+                        elif time.perf_counter() - joined > 10.0:
+                            loops = 0  # force re-arm below
+                        else:
+                            continue
+                        stalled = True
+                    else:
+                        stalled = loops == 0 or (loops <= 1 and (time.perf_counter() - started) > 10.0)
+                    if stalled:
+                        logger.warning(
+                            "Voice mixer watchdog: player stalled (loops=%s, age=%.1fs) — re-playing (guild=%d)",
+                            loops, (time.perf_counter() - started) if started is not None else -1.0, guild_id,
+                        )
+                        try:
+                            vc.stop()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.2)
+                        if vc.is_connected() and self._voice_mixers.get(guild_id) is mixer:
+                            vc.play(mixer, after=lambda e: None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("Mixer watchdog exited (guild=%d): %s", guild_id, e)
+        task = asyncio.ensure_future(_watchdog())
+        tasks = getattr(self, "_voice_mixer_watchdogs", None)
+        if tasks is None:
+            tasks = self._voice_mixer_watchdogs = {}
+        old = tasks.pop(guild_id, None)
+        if old:
+            old.cancel()
+        tasks[guild_id] = task
 
     def _lead_silence_bytes(self) -> bytes:
         """Silence prepended to speech clips: Discord's voice socket warm-up otherwise clips
@@ -3868,8 +3957,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         try:
             playback_timeout = await self._playback_timeout_for_audio(audio_path)
             # ── Mixer path (overlap + ducking) ──────────────────────────────
+            # When voice_fx.enabled is false, skip the mixer entirely: its continuous
+            # send clock can wedge under DAVE (packets counted as sent but speech never
+            # drains/audible); the one-shot FFmpegPCMAudio path below is discord.py's
+            # proven playback route.
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
-            if mixer is not None:
+            if mixer is not None and self._voice_fx_cfg.get("enabled", True):
                 decode_to_pcm = _voice_mixer_module().decode_to_pcm
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
                 if pcm:
@@ -3879,7 +3972,22 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     wait_start = time.monotonic()
                     while mixer.speech_active:
                         if time.monotonic() - wait_start > playback_timeout:
-                            logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
+                            conn = getattr(vc, "_connection", None)
+                            ds = getattr(conn, "dave_session", None)
+                            try:
+                                ds_info = (
+                                    f"ready={ds.ready} status={ds.status} epoch={ds.epoch}"
+                                    if ds is not None else "None"
+                                )
+                            except Exception as e:
+                                ds_info = f"unavailable ({e})"
+                            logger.warning(
+                                "Mixer speech playback timed out after %.1fs "
+                                "(playing=%s can_encrypt=%s dave=%s outbound=%s)",
+                                playback_timeout, vc.is_playing(),
+                                getattr(conn, "can_encrypt", "?"), ds_info,
+                                self._voice_outbound_snapshot(guild_id),
+                            )
                             mixer.stop_speech()
                             break
                         await asyncio.sleep(0.05)
@@ -3929,6 +4037,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
+
+    def _voice_outbound_snapshot(self, guild_id: int) -> dict:
+        """Transport state for the speech-timeout warning: negotiated mode + DAVE state."""
+        vc = self._voice_clients.get(guild_id)
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        conn = getattr(vc, "_connection", None) if vc is not None else None
+        ds = getattr(conn, "dave_session", None) if conn is not None else None
+        dave_stats = None
+        try:
+            if ds is not None:
+                ds_stats = ds.get_encryption_stats()
+                dave_stats = (
+                    f"ok={ds_stats.successes} fail={ds_stats.failures} attempts={ds_stats.attempts}"
+                )
+        except Exception:
+            pass
+        return {
+            "mode": getattr(vc, "mode", "?") if vc else "not-connected",
+            "mixer_reads": getattr(mixer, "read_count", -1) if mixer is not None else -1,
+            "dave_ready": getattr(ds, "ready", None) if ds is not None else None,
+            "dave_epoch": getattr(ds, "epoch", None) if ds is not None else None,
+            "dave_enc_stats": dave_stats,
+        }
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""

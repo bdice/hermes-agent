@@ -1564,7 +1564,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 # Auto-follow runs before the bot-in-channel gate: the whole point is to
                 # join when the bot is NOT yet connected.
                 joined = before.channel is None and after.channel is not None
-                if joined and adapter_self._voice_auto_follow_enabled():
+                if joined and after.channel is not None and (
+                        adapter_self._voice_auto_follow_enabled()
+                        or adapter_self._voice_auto_follow_enabled(after.channel.id)):
                     asyncio.ensure_future(adapter_self._maybe_auto_follow_voice(member, after.channel))
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -3644,9 +3646,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     def _voice_auto_follow_enabled(self, text_channel_id: int | None = None) -> bool:
         """discord.voice_auto_follow: join a VC automatically when an authorized member joins.
-        Set discord.voice_auto_follow_channels to a list of text-channel ids or names to scope
-        it: with the list set, only the channel an authorized user last spoke in that is also
-        listed may arm/trigger a follow."""
+        discord.voice_auto_follow_channels is a list of ids or names (case-insensitive, '#'
+        optional) checked against BOTH sides: the voice channel being joined and the text
+        channel replies bind to. Either side matching when set is enough; unset means follow
+        anywhere. The voice-channel side is what makes joining the named VC alone sufficient."""
         try:
             from hermes_cli.config import read_raw_config
             cfg = read_raw_config() or {}
@@ -3684,21 +3687,62 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     await vc.move_to(channel)
                     self._reset_voice_timeout(guild_id)
                 return
+            vc_named = self._voice_auto_follow_enabled(channel.id)
             text_ch_id = getattr(self, "_voice_auto_follow_bound", {}).get(guild_id)
-            if text_ch_id is None or not self._voice_auto_follow_enabled(text_ch_id):
-                # No text-channel binding for this guild (or it's outside the allowed
-                # channels): never guess a reply destination. Drop a stale out-of-scope
-                # binding so a later in-scope message arms cleanly. The user's next typed
-                # message in an allowed channel arms auto-follow for it.
+            if text_ch_id is not None and not vc_named and not self._voice_auto_follow_enabled(text_ch_id):
+                # Binding exists but neither side matches the allowlist: drop the stale
+                # out-of-scope binding and stay put.
                 self._voice_auto_follow_bound.pop(guild_id, None)
                 self._voice_auto_follow_user_id.pop(guild_id, None)
                 return
+            if text_ch_id is None:
+                if not vc_named:
+                    # Neither a text binding nor a named VC: never guess a destination.
+                    return
+                # Joining the named voice channel alone is enough to trigger; replies
+                # bind to the configured home channel.
+                text_ch_id = self._voice_auto_follow_default_channel(guild_id)
+                if text_ch_id is None:
+                    logger.info(
+                        "Auto-follow: no binding and no home channel configured (guild %s)",
+                        guild_id)
+                    return
+            logger.info(
+                "Auto-follow attempt: user=%d vc=%s bound=%s",
+                member.id, channel.name, text_ch_id)
             result = await self._voice_join_handler(channel, text_ch_id)
             logger.info(
                 "Auto-follow %s -> VC %s (text bind %s): %s",
                 member.display_name, channel.name, text_ch_id, result or "joined")
         except Exception as e:
             logger.warning("Voice auto-follow failed: %s", e)
+
+    def _voice_auto_follow_default_channel(self, guild_id: int):
+        """Fallback reply target for an unbound named-VC follow: the guild's own
+        #hermes text channel, else the configured platform home channel."""
+        try:
+            if self._client is not None:
+                guild = self._client.get_guild(guild_id)
+                if guild is not None:
+                    allowed = set()
+                    try:
+                        from hermes_cli.config import read_raw_config
+                        disc = (read_raw_config() or {}).get("discord") or {}
+                        allowed = {str(x).strip().lstrip("#").lower()
+                                   for x in (disc.get("voice_auto_follow_channels") or []) if str(x).strip()}
+                    except Exception:
+                        pass
+                    want = allowed or {"hermes"}
+                    for ch in guild.text_channels:
+                        if ch.name.lower() in want:
+                            return ch.id
+            cfg = getattr(self, "config", None)
+            home = getattr(cfg, "home_channel", None)
+            if home is not None and str(getattr(home, "chat_id", "") or "").isdigit():
+                return int(home.chat_id)
+        except Exception:
+            logger.debug("auto-follow home channel lookup failed", exc_info=True)
+        return None
 
     async def _voice_join_handler(self, channel, text_channel_id: int):
         """Delegate an auto-follow join to the runner wiring installed by run_voice.py."""

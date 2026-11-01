@@ -83,6 +83,9 @@ class GatewayVoiceMixin:
         and user so a later VC join can bind replies without guessing a destination."""
         try:
             if getattr(source, "platform", None) != Platform.DISCORD:
+                logger.info(
+                    "Voice auto-follow NOT armed: platform=%r (expected %r)",
+                    getattr(source, "platform", None), Platform.DISCORD)
                 return
             if getattr(source, "chat_type", None) == "dm" or not getattr(source, "guild_id", None):
                 logger.info(

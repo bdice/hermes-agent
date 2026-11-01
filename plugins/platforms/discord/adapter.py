@@ -4015,9 +4015,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
+        logger.info(
+            "join_voice_channel: vc=%s guild=%s existing=%s connected=%s",
+            getattr(channel, "name", channel), guild_id,
+            guild_id in self._voice_clients,
+            bool(self._voice_clients.get(guild_id) and self._voice_clients[guild_id].is_connected()))
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
+                logger.info(
+                    "join_voice_channel fast-path: already in %s (target %s, receiver=%s)",
+                    getattr(existing.channel, "name", "?"),
+                    getattr(channel, "name", "?"), guild_id in self._voice_receivers)
                 if existing.channel.id != channel.id:
                     await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
@@ -4026,10 +4035,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 # join whose receiver start raised) — that state is deaf, so rebuild it.
                 if guild_id not in self._voice_receivers or guild_id not in self._voice_listen_tasks:
                     logger.warning(
-                        "Voice join found a connection with no live receiver (guild=%s); restarting it",
+                        "Voice join found a connection with no live receiver (guild=%s); rebuilding",
                         guild_id)
+                    await self.leave_voice_channel(guild_id)
+                    vc = await channel.connect()
+                    self._voice_clients[guild_id] = vc
+                    self._reset_voice_timeout(guild_id)
+                    self._bind_voice_text_channel(guild_id, text_channel_id, source)
                     try:
-                        receiver = VoiceReceiver(existing, allowed_user_ids=self._allowed_user_ids)
+                        receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
                         receiver.start()
                         self._voice_receivers[guild_id] = receiver
                         self._voice_listen_tasks[guild_id] = asyncio.ensure_future(

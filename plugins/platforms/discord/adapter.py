@@ -3687,8 +3687,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             text_ch_id = getattr(self, "_voice_auto_follow_bound", {}).get(guild_id)
             if text_ch_id is None or not self._voice_auto_follow_enabled(text_ch_id):
                 # No text-channel binding for this guild (or it's outside the allowed
-                # channels): never guess a reply destination. The user's next typed
+                # channels): never guess a reply destination. Drop a stale out-of-scope
+                # binding so a later in-scope message arms cleanly. The user's next typed
                 # message in an allowed channel arms auto-follow for it.
+                self._voice_auto_follow_bound.pop(guild_id, None)
+                self._voice_auto_follow_user_id.pop(guild_id, None)
                 return
             result = await self._voice_join_handler(channel, text_ch_id)
             if result:

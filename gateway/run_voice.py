@@ -61,6 +61,17 @@ class GatewayVoiceMixin:
         if hasattr(adapter, "_voice_autofollow_join"):
             adapter._voice_autofollow_join = functools.partial(
                 self._handle_voice_autofollow_join, adapter=adapter)
+        if hasattr(adapter, "_voice_follow_mode_getter"):
+            def _follow_mode(user_id, channel_id, _ad=adapter):
+                guild_id = GatewayVoiceMixin._guild_of_channel(_ad, channel_id)
+                return (guild_id, int(user_id)) in getattr(_ad, "_voice_following", {})
+            adapter._voice_follow_mode_getter = _follow_mode
+
+    @staticmethod
+    def _guild_of_channel(adapter, channel_id):
+        client = getattr(adapter, "_client", None)
+        ch = client.get_channel(int(channel_id)) if client else None
+        return int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
 
     async def _handle_voice_autofollow_join(self, channel, text_channel_id: int, *, adapter):
         """Auto-follow entry from the Discord adapter: a VC join by an authorized member

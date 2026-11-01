@@ -659,6 +659,14 @@ override-dependencies = [
   # Remove this line when browser-harness allows Pillow 13. Plugin workspaces
   # inherit [tool.uv], so a plugin requiring pillow<13 also gets 13.0.0.
   "Pillow==13.0.0",
+  # torch 2.14.1 pins nvidia-cusparselt-cu13==0.8.1, whose aarch64 wheel ships
+  # `Tag: py3-none-manylinux2014_sbsa` in its WHEEL metadata under an aarch64
+  # filename, so PM's install-time `uv pip check` rejects the venv as "built for
+  # a different platform" on Linux aarch64. 0.8.1.post1 republishes the same
+  # library with the aarch64 tag. pm/pip_check.py accepts torch's resulting
+  # ==0.8.1 mismatch because uv.lock records this override.
+  # Remove this line when torch requires a cusparselt release with correct tags.
+  "nvidia-cusparselt-cu13==0.8.1.post1; sys_platform == 'linux'",
   # misaki[en] (pulled by [kittentts]) lists spacy-curated-transformers.
   # The newest release that fits spacy 3.8 (2.x needs thinc 9), 0.3.1, caps
   # Python below 3.14, so PM's `uv pip check` rejects the venv. Nothing

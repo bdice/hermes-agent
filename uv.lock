@@ -19,6 +19,7 @@ certifi = false
 [manifest]
 overrides = [
     { name = "cryptography", specifier = "==50.0.2" },
+    { name = "nvidia-cusparselt-cu13", marker = "sys_platform == 'linux'", specifier = "==0.8.1.post1" },
     { name = "pillow", specifier = "==13.0.0" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
     { name = "spacy-curated-transformers", marker = "sys_platform == 'never'" },
@@ -4203,11 +4204,11 @@ wheels = [
 
 [[package]]
 name = "nvidia-cusparselt-cu13"
-version = "0.8.1"
+version = "0.8.1.post1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/e1/cdc1797eadf82d3a9a575a19b33fdc871a97edbec42c00b5b5e914f4aff4/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl", hash = "sha256:4dca476c50bf4780d46cd0bfbd82e2bc10a08e4fef7950917ce8d7578d22a23f", size = 221051344, upload-time = "2025-09-05T18:49:51.289Z" },
-    { url = "https://files.pythonhosted.org/packages/34/7d/2661f2fb3ac4302f3a246f5fc030213ac60c1fe0bce84f9783dbd831dbb7/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_x86_64.whl", hash = "sha256:786ce87568c303fadb5afcc7102d454cd3040d75f6f8626f5db460d1871f4dd0", size = 170148586, upload-time = "2025-09-05T18:50:50.248Z" },
+    { url = "https://files.pythonhosted.org/packages/06/e8/ac5f838daf0c563a1ee988a76f0184cf91c87f89fe41de4de297379e8e16/nvidia_cusparselt_cu13-0.8.1.post1-py3-none-manylinux2014_aarch64.whl", hash = "sha256:a09083b10c1290385107431c834d623580ff53df7dd5acd9b25f724e67fba8bf", size = 221051407, upload-time = "2026-10-21T18:26:07.391Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/4d/84149aecfc0cc3c448e09494ba1a71b1667f3dc4179c79834a3c708046aa/nvidia_cusparselt_cu13-0.8.1.post1-py3-none-manylinux2014_x86_64.whl", hash = "sha256:0dd8522d704f8181f5fa60b14e350495096bc53990749b7685e82262ac53b48c", size = 170148641, upload-time = "2026-10-21T18:26:41.087Z" },
 ]
 
 [[package]]

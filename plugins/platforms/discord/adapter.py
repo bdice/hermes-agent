@@ -4159,6 +4159,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     except Exception:
                         pass
                 completed = receiver.check_silence()
+                # Hearing anyone speak counts as activity. Without this, a long agent
+                # stretch (image rendering, tool runs) can burn the whole inactivity
+                # budget after the last reply finishes and eject the bot while the
+                # user is still in the channel wanting to talk back.
+                if completed:
+                    self._reset_voice_timeout(guild_id)
                 # Each utterance keeps the binding it was collected under, not one set during an earlier STT.
                 captured_for = self._voice_text_channels.get(guild_id)
                 # Pass guild so role checks stay guild-scoped.

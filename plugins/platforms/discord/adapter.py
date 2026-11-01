@@ -3679,10 +3679,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if member.bot or not self._is_allowed_user(str(member.id), guild=channel.guild, is_dm=False):
                 return
             if not getattr(self, "_voice_autofollow_join", None):
-                # Runner wiring not installed yet; nothing safe to bind replies to.
+                logger.info("Auto-follow skipped: runner wiring not installed (guild %s)",
+                            channel.guild.id)
                 return
             vc = self._voice_clients.get(guild_id)
             if vc is not None and vc.is_connected():
+                logger.info(
+                    "Auto-follow skipped: bot already in VC %s (guild %s)",
+                    getattr(getattr(vc, "channel", None), "name", None), guild_id)
                 if getattr(vc, "channel", None) is not None and vc.channel.id != channel.id:
                     await vc.move_to(channel)
                     self._reset_voice_timeout(guild_id)

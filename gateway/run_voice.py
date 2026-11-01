@@ -84,7 +84,8 @@ class GatewayVoiceMixin:
             if getattr(source, "chat_type", None) == "dm" or not getattr(source, "guild_id", None):
                 return
             adapter = self.adapters.get(Platform.DISCORD)  # type: ignore[attr-defined]
-            if adapter is None or not getattr(adapter, "_voice_auto_follow_enabled", lambda: False)():
+            if adapter is None or not getattr(adapter, "_voice_auto_follow_enabled", lambda *_a: False)(
+                    int(source.chat_id)):
                 return
             guild_id = int(source.guild_id)
             # Only arm the lane the user actually uses for voice: their last channel in the

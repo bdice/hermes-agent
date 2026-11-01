@@ -3642,12 +3642,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT, minimum=0,
         )
 
-    def _voice_auto_follow_enabled(self) -> bool:
-        """discord.voice_auto_follow: join a VC automatically when an authorized member joins."""
+    def _voice_auto_follow_enabled(self, text_channel_id: int | None = None) -> bool:
+        """discord.voice_auto_follow: join a VC automatically when an authorized member joins.
+        Set discord.voice_auto_follow_channels to a list of text-channel ids or names to scope
+        it: with the list set, only the channel an authorized user last spoke in that is also
+        listed may arm/trigger a follow."""
         try:
             from hermes_cli.config import read_raw_config
             cfg = read_raw_config() or {}
-            return bool((cfg.get("discord") or {}).get("voice_auto_follow", False))
+            disc = cfg.get("discord") or {}
+            if not bool(disc.get("voice_auto_follow", False)):
+                return False
+            allowed = disc.get("voice_auto_follow_channels")
+            if allowed is None:
+                return True
+            if text_channel_id is None:
+                # Gate probe before a binding exists: allow, then re-check the bound channel.
+                return True
+            allowed_set = {str(x).strip().lstrip("#").lower() for x in (allowed or []) if str(x).strip()}
+            if str(text_channel_id) in allowed_set:
+                return True
+            # Names accepted too (names are unique enough within a guild for this gate).
+            ch = self._client.get_channel(int(text_channel_id)) if self._client else None
+            return getattr(ch, "name", "").lower() in allowed_set
         except Exception:
             return False
 
@@ -3668,9 +3685,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     self._reset_voice_timeout(guild_id)
                 return
             text_ch_id = getattr(self, "_voice_auto_follow_bound", {}).get(guild_id)
-            if text_ch_id is None:
-                # No text-channel binding for this guild: never guess a reply destination.
-                # The user's first typed message in a channel arms auto-follow for it.
+            if text_ch_id is None or not self._voice_auto_follow_enabled(text_ch_id):
+                # No text-channel binding for this guild (or it's outside the allowed
+                # channels): never guess a reply destination. The user's next typed
+                # message in an allowed channel arms auto-follow for it.
                 return
             result = await self._voice_join_handler(channel, text_ch_id)
             if result:

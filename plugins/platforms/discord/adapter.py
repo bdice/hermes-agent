@@ -3694,8 +3694,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._voice_auto_follow_user_id.pop(guild_id, None)
                 return
             result = await self._voice_join_handler(channel, text_ch_id)
-            if result:
-                logger.info("Auto-followed %s into voice channel %s", member.display_name, channel.name)
+            logger.info(
+                "Auto-follow %s -> VC %s (text bind %s): %s",
+                member.display_name, channel.name, text_ch_id, result or "joined")
         except Exception as e:
             logger.warning("Voice auto-follow failed: %s", e)
 

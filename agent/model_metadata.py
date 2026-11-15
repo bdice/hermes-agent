@@ -1097,6 +1097,25 @@ def _resolve_endpoint_context_length(model: str, base_url: str, api_key: str = "
     return context_length if isinstance(context_length, int) else None
 
 
+def declared_max_output_tokens(model: str, base_url: str, api_key: object = "") -> Optional[int]:
+    """Output cap a custom endpoint's ``/models`` declares for *model*, or None.
+
+    A LiteLLM-style proxy applies its own small default (often 4096) when a request omits
+    ``max_tokens``, while the same proxy advertises the model's real limit. Known providers,
+    local servers, and declarations that leave no room for input are ignored."""
+    if not model or not _is_custom_endpoint(base_url) or _is_known_provider_base_url(base_url):
+        return None
+    if is_local_endpoint(base_url):
+        return None
+    entry = fetch_endpoint_model_metadata(base_url, api_key=api_key).get(model)
+    if not entry:
+        return None
+    cap, ctx = entry.get("max_completion_tokens"), entry.get("context_length")
+    if not isinstance(cap, int) or cap <= 0 or (isinstance(ctx, int) and cap >= ctx):
+        return None
+    return cap
+
+
 def _get_context_cache_path() -> Path:
     """Path to the persistent context length cache file."""
     from hermes_constants import get_hermes_home

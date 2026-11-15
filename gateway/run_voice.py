@@ -52,9 +52,6 @@ class GatewayVoiceMixin:
 
     def _bind_voice_input_callback(self, adapter) -> None:
         """Route voice transcripts back through the adapter that captured them."""
-        logger.info(
-            "Voice auto-follow wiring installed on adapter (name=%s)",
-            getattr(adapter, "name", "?"))
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
@@ -90,7 +87,11 @@ class GatewayVoiceMixin:
         # guild_id stays int here; a str would make discord.py's id comparisons
         # silently no-op the join/move.
         result = await self._join_voice_channel_for_source(source, int(guild_id))
-        logger.info("Auto-follow join handler result: %r", result)
+        # Voice mode must follow the reply binding, not the last manual /voice join: the join
+        # above already armed "all" for text_channel_id, so a spoken turn answered in this
+        # channel always plays its TTS in the VC instead of replying text-only.
+        self._apply_voice_mode(adapter, self._voice_key_for_source(source),
+                               str(text_channel_id), "all")
         return result
 
     def _remember_voice_autofollow_source(self, source) -> None:
@@ -98,16 +99,8 @@ class GatewayVoiceMixin:
         and user so a later VC join can bind replies without guessing a destination."""
         try:
             if getattr(source, "platform", None) != Platform.DISCORD:
-                logger.info(
-                    "Voice auto-follow NOT armed: platform=%r (expected %r)",
-                    getattr(source, "platform", None), Platform.DISCORD)
                 return
             if getattr(source, "chat_type", None) == "dm" or not getattr(source, "guild_id", None):
-                logger.info(
-                    "Voice auto-follow NOT armed: chat_type=%s guild_id=%s platform=%s",
-                    getattr(source, "chat_type", None),
-                    getattr(source, "guild_id", None),
-                    getattr(source, "platform", None))
                 return
             adapters = getattr(self, "adapters", {}) or {}
             adapter = adapters.get(Platform.DISCORD)
@@ -130,9 +123,6 @@ class GatewayVoiceMixin:
             if not hasattr(adapter, "_voice_auto_follow_user_id"):
                 adapter._voice_auto_follow_user_id = {}
             adapter._voice_auto_follow_user_id[guild_id] = str(source.user_id)
-            logger.info(
-                "Voice auto-follow armed: guild=%s channel=%s user=%s",
-                guild_id, source.chat_id, source.user_id)
         except Exception:
             logger.warning("voice auto-follow arm failed", exc_info=True)
 
@@ -402,6 +392,14 @@ class GatewayVoiceMixin:
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
         if not text_ch_id:
             return
+        # The binding may be the session's thread (one thread per voice conversation): voice
+        # mode was armed for the join's parent channel, so arm the thread key too — otherwise
+        # _should_send_voice_reply sees mode=None for thread-bound turns and stays text-only.
+        with suppress(Exception):
+            _thread_key = self._voice_key(Platform.DISCORD, str(text_ch_id),
+                                          profile=getattr(adapter, "_owner_profile", None))
+            if self._voice_mode.get(_thread_key) != "all":
+                self._apply_voice_mode(adapter, _thread_key, str(text_ch_id), "all")
         source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
         # The cached source still carries the previous speaker's identity (per-sender routes,
         # #106019): drop the pin so the seam re-resolves for THIS speaker.

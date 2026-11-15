@@ -29,6 +29,45 @@ class DiscordVoiceInfoMixin:
         if source is not None:
             self._voice_sources[guild_id] = source
 
+    async def _voice_session_thread(self, guild_id: int, captured_for: int, transcript: str):
+        """The guild's one thread for the current voice conversation, created lazily at the first
+        utterance and reused for every later turn; None when unavailable (caller stays inline).
+
+        The join binds replies to a text channel, which buries a whole spoken conversation in
+        channel traffic. Moving the binding to a thread of that channel gives each session its
+        own room; the parent is no longer the bound (voice-linked) channel, so typed messages
+        there auto-thread normally again. ``leave_voice_channel`` clears the mapping so the next
+        conversation opens a fresh thread. Naming follows the auto-thread convention: a fast
+        placeholder now, semantic rename after the first turn.
+        """
+        import discord as _discord
+        import logging
+        logger = logging.getLogger(type(self).__module__)
+        bound = self._client.get_channel(int(captured_for)) if self._client else None
+        if bound is None or isinstance(bound, _discord.DMChannel):
+            return None
+        existing_id = self._voice_session_threads.get(guild_id)
+        if existing_id is not None:
+            if str(existing_id) == str(captured_for):
+                return bound  # binding already IS the session thread (later utterances)
+            thread = self._client.get_channel(int(existing_id))
+            if isinstance(thread, _discord.Thread):
+                return thread
+        parent = getattr(bound, "parent", None) or bound
+        name = self._derive_auto_thread_name(transcript)
+        try:
+            thread = await parent.create_thread(
+                name=name, auto_archive_duration=1440,
+                reason="Voice conversation session")
+        except Exception as e:
+            logger.warning("Voice session thread creation failed (guild=%s): %s — "
+                           "keeping inline replies", guild_id, e)
+            return None
+        self._voice_session_threads[guild_id] = thread.id
+        logger.info("Voice session thread opened: %s (%s) under #%s (guild=%s)",
+                    name, thread.id, getattr(parent, "name", "?"), guild_id)
+        return thread
+
     def get_voice_channel_info(self, guild_id: int) -> Optional[dict[str, Any]]:
         """Return voice channel info (name, members, count, speaking user IDs) or None if not connected."""
         vc = self._voice_clients.get(guild_id)

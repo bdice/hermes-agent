@@ -2374,6 +2374,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             http = getattr(self._client, "http", None)
             has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
             previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
+            # discord.py bakes HTTPClient.max_ratelimit_timeout into each Ratelimit bucket at
+            # bucket-creation time, so buckets born during the swap below keep the 30s cap
+            # forever: discord.py then raises RateLimited locally (never contacting Discord)
+            # for unrelated routes, e.g. auto-thread creation minutes after a prior thread
+            # start left the bucket expiring >30s out. Snapshot the keys so buckets created
+            # during the swap are dropped afterwards and recreated with the restored timeout.
+            pre_sync_bucket_keys = frozenset(getattr(http, "_buckets", None) or {})
             if has_ratelimit_timeout:
                 http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
             try:
@@ -2395,6 +2402,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             finally:
                 if has_ratelimit_timeout:
                     http.max_ratelimit_timeout = previous_ratelimit_timeout
+                    # Drop buckets created during the swap so the next request recreates them
+                    # with the restored timeout. Idle buckets only: one with in-flight or
+                    # queued requests must keep serving them until discord.py ages it out.
+                    buckets = getattr(http, "_buckets", None) or {}
+                    for key in list(buckets):
+                        if key in pre_sync_bucket_keys:
+                            continue
+                        bucket = buckets[key]
+                        if (getattr(bucket, "outgoing", 0) == 0
+                                and not getattr(bucket, "_pending_requests", None)):
+                            del buckets[key]
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",

@@ -3749,7 +3749,7 @@ def _prepare_same_provider_retry(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
+        base_url=retry_base or resolved_base_url, task=task, api_key=getattr(retry_client, "api_key", "") or "",
     )
     # Preserve per-request attribution headers (a profile's ``request_headers``) across the rebuilt-client
     # retry: dropping them would let a recovery retry silently lose capability gating (#60293).
@@ -6684,7 +6684,7 @@ def _build_call_kwargs(
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
     extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None, task: Optional[str] = None,
-    no_progress_timeout: Optional[float] = None,
+    no_progress_timeout: Optional[float] = None, api_key: object = "",
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments.
     ``no_progress_timeout`` is a Codex-Responses-only extra (consumed by
@@ -6709,6 +6709,14 @@ def _build_call_kwargs(
     provider_norm = str(provider or "").strip().lower()
     if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task):
         kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
+    elif max_tokens is None and effective_base:
+        try:
+            from agent.model_metadata import declared_max_output_tokens
+            declared = declared_max_output_tokens(model, effective_base, api_key)
+        except Exception:
+            declared = None
+        if declared:
+            kwargs.update(auxiliary_max_tokens_param(declared, model=model))
     if tools:
         kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
     # Provider profiles are the source of truth for reasoning wire shapes (top-level, nested body,
@@ -7469,7 +7477,7 @@ def _prepare_aux_request(
         request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
+        no_progress_timeout=no_progress_timeout, api_key=getattr(client, "api_key", "") or "")
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)

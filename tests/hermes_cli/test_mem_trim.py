@@ -10,6 +10,7 @@ from hermes_cli import mem_trim
 @pytest.fixture(autouse=True)
 def _reset_trim_state(monkeypatch):
     monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
+    monkeypatch.setattr(mem_trim, "_last_alloc_trim_monotonic", 0.0)
     monkeypatch.setattr(mem_trim, "_probe_done", True)
     monkeypatch.setattr(mem_trim, "_malloc_trim", None)
     monkeypatch.setattr(mem_trim, "_trim_call_count", 0)
@@ -159,3 +160,46 @@ def test_force_floor_coalesces_burst_closes(monkeypatch):
     monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 106.0)
     assert mem_trim.trim_memory(force=True, reason="agent close") is True
     assert trim.call_count == 2
+
+
+def test_timer_lane_trim_skips_the_forced_collection(monkeypatch):
+    """A periodic timer lane asks for the allocator trim only (``collect=False``): cycles are left
+    to CPython's own generational collection, so no full gen2 pass holds the GIL for hundreds of ms
+    and freezes every thread in the process (#139763)."""
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+
+    assert mem_trim.trim_memory(reason="timer", cooldown_seconds=60, collect=False) is True
+    collect.assert_not_called()
+    trim.assert_called_once_with(0)
+    assert mem_trim._last_alloc_trim_monotonic == 100.0
+
+
+def test_pressure_lane_still_collects_before_trimming(monkeypatch):
+    """The default stays a collect-then-trim: on the pressure lanes (agent close, large tool
+    result, post-compression) a collection is what makes the trim return anything."""
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+
+    assert mem_trim.trim_memory(reason="large tool result", cooldown_seconds=60) is True
+    collect.assert_called_once_with()
+    trim.assert_called_once_with(0)
+
+def test_allocator_only_trim_does_not_suppress_a_forced_collection(monkeypatch):
+    """An allocator-only housekeeping trim must not make a forced full collection right after it
+    (agent-cache pressure eviction) return early inside the 5 s force floor."""
+    calls = []
+    monkeypatch.setattr(mem_trim.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(mem_trim, "_malloc_trim", lambda pad: 1)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 60.0, 1, 0.0))
+
+    assert mem_trim.trim_memory(reason="housekeeping", collect=False) is True
+    assert mem_trim.trim_memory(force=True, reason="agent_cache_pressure") is True
+    assert calls == ["gc"]

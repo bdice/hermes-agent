@@ -28,8 +28,9 @@ import { computed } from 'nanostores'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { $liveWorkRoster, noteEventFed, rosterLiveIds, rosterSaysIdle } from './live-work-roster'
 import { $pausedQueueSessionIds } from './owner-queue-reconcile'
-import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
+import { $cronSessions, $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
   $draftSessionIds,
@@ -50,18 +51,30 @@ import { $subagentsBySession, activeSubagentCount } from './subagents'
 // lineageAliases covers whichever tip of the conversation a surface holds.
 let delegatingIds: readonly string[] = []
 export const $delegatingSessionIds = computed(
-  [$subagentsBySession, $sessionStates, $sessions],
-  (bySession, states, sessions) => {
+  [$subagentsBySession, $sessionStates, $sessions, $liveWorkRoster],
+  (bySession, states, sessions, roster) => {
     const ids = new Set<string>()
+    const eventFedAt = new Map<string, number>()
 
     for (const [runtimeId, items] of Object.entries(bySession)) {
-      if (activeSubagentCount(items) === 0) {
+      if (items.length === 0) {
         continue
       }
 
-      for (const alias of lineageAliases(states[runtimeId]?.storedSessionId ?? runtimeId, sessions)) {
-        ids.add(alias)
+      const aliases = lineageAliases(states[runtimeId]?.storedSessionId ?? runtimeId, sessions)
+      const heardAt = Math.max(...items.map(item => item.updatedAt || 0))
+      noteEventFed(eventFedAt, aliases, heardAt)
+
+      if (activeSubagentCount(items) > 0 && !rosterSaysIdle(roster, 'subagents', aliases, heardAt)) {
+        for (const alias of aliases) {
+          ids.add(alias)
+        }
       }
+    }
+
+    // Rows no current event feed speaks for (off screen, every row after a reload).
+    for (const alias of rosterLiveIds(roster, 'subagents', eventFedAt, sessions)) {
+      ids.add(alias)
     }
 
     return (delegatingIds = stableArray(delegatingIds, [...ids]))
@@ -114,10 +127,25 @@ export const $sessionDotStateById = computed(
     $unreadFinishedSessionIds,
     $draftSessionIds,
     $sessions,
+    $messagingSessions,
+    $cronSessions,
     $unreadWriteGuard,
     $pausedQueueSessionIds
   ],
-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard, paused) => {
+  (
+    attention,
+    working,
+    stalled,
+    background,
+    delegating,
+    unread,
+    draft,
+    sessions,
+    messaging,
+    cron,
+    unreadWriteGuard,
+    paused
+  ) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -142,10 +170,11 @@ export const $sessionDotStateById = computed(
     // restarts. Same tier as the runtime marker — both mean "there is
     // something here you haven't opened". A list page that predates one of
     // our own writes is fenced out by the write guard: keep OUR value until a
-    // page confirms it or the guard expires.
+    // page confirms it or the guard expires. Every listed slice carries the
+    // flag: a Telegram row lives only in messaging (#126732).
     const persistedUnread: string[] = []
 
-    for (const s of sessions) {
+    for (const s of [...sessions, ...messaging, ...cron]) {
       const entry = unreadWriteGuard.get(s.id)
 
       if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {

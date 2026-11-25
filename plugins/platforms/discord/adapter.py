@@ -1231,6 +1231,10 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         # existing text batcher during this short, sender-scoped window.
         self._bot_tag_debounce_until: dict[str, float] = {}
         self._voice_text_channels: dict[int, int] = {}  # guild_id -> text_channel_id
+        # Per voice conversation session: guild_id -> the thread all its turns live in. Created
+        # lazily at the first utterance, cleared when the voice channel is left, so each spoken
+        # conversation gets exactly one thread (#voice-session-threads).
+        self._voice_session_threads: dict[int, int] = {}  # guild_id -> thread_id
         self._voice_sources: dict[int, dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: dict[int, asyncio.Task] = {}  # guild_id -> timeout task
         self._voice_timeout_seconds = self._load_voice_timeout()
@@ -2365,6 +2369,13 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             http = getattr(self._client, "http", None)
             has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
             previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
+            # discord.py bakes HTTPClient.max_ratelimit_timeout into each Ratelimit bucket at
+            # bucket-creation time, so buckets born during the swap below keep the 30s cap
+            # forever: discord.py then raises RateLimited locally (never contacting Discord)
+            # for unrelated routes, e.g. auto-thread creation minutes after a prior thread
+            # start left the bucket expiring >30s out. Snapshot the keys so buckets created
+            # during the swap are dropped afterwards and recreated with the restored timeout.
+            pre_sync_bucket_keys = frozenset(getattr(http, "_buckets", None) or {})
             if has_ratelimit_timeout:
                 http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
             try:
@@ -2386,6 +2397,17 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             finally:
                 if has_ratelimit_timeout:
                     http.max_ratelimit_timeout = previous_ratelimit_timeout
+                    # Drop buckets created during the swap so the next request recreates them
+                    # with the restored timeout. Idle buckets only: one with in-flight or
+                    # queued requests must keep serving them until discord.py ages it out.
+                    buckets = getattr(http, "_buckets", None) or {}
+                    for key in list(buckets):
+                        if key in pre_sync_bucket_keys:
+                            continue
+                        bucket = buckets[key]
+                        if (getattr(bucket, "outgoing", 0) == 0
+                                and not getattr(bucket, "_pending_requests", None)):
+                            del buckets[key]
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
@@ -3474,12 +3496,6 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                         "Auto-follow: no binding and no home channel configured (guild %s)",
                         guild_id)
                     return
-            logger.info(
-                "Auto-follow attempt: user=%d vc=%s bound=%s",
-                member.id, channel.name, text_ch_id)
-            # Self-heal the wiring: a gateway whose wiring install raced has no handler.
-            if not getattr(self, "_voice_autofollow_join", None):
-                self._install_autofollow_wiring_fallback()
             # Bind the reply routing through the runner (text channel + voice mode);
             # the connection itself is established directly by this adapter below.
             try:
@@ -3488,12 +3504,8 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 logger.warning("Auto-follow runner binding failed: %s", e)
             joined = await self.join_voice_channel(
                 channel, text_channel_id=int(text_ch_id))
-            receiver_live = guild_id in self._voice_receivers
             if joined:
                 self._voice_following[(guild_id, member.id)] = channel.id
-            logger.info(
-                "Auto-follow %s -> VC %s (text bind %s): joined=%s receiver=%s",
-                member.display_name, channel.name, text_ch_id, joined, receiver_live)
             if joined:
                 try:
                     await channel.send(f"🎙️ Followed you in — go ahead and talk, {member.mention}.")
@@ -3529,25 +3541,6 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             logger.debug("auto-follow home channel lookup failed", exc_info=True)
         return None
 
-    def _install_autofollow_wiring_fallback(self) -> None:
-        """Install the runner's auto-follow handler if it was never wired at startup.
-        Finds the live runner via the voice-input callback set by run_voice.py; falls
-        back to a plain adapter-level join so the bot at least follows audibly."""
-        cb = getattr(self, "_voice_input_callback", None)
-        runner = getattr(cb, "args", (None,))[0] if cb is not None else None
-        handler = getattr(runner, "_handle_voice_autofollow_join", None) if runner else None
-        if handler is not None:
-            import functools
-            self._voice_autofollow_join = functools.partial(handler, adapter=self)
-            logger.info("Auto-follow wiring installed via fallback (runner=%s)", type(runner).__name__)
-            return
-        async def _fallback_join(channel, text_channel_id: int):
-            # Adapter-only fallback: bind routing fields directly; no runner features.
-            self._bind_voice_text_channel(channel.guild.id, int(text_channel_id), None)
-            return "bound"
-        self._voice_autofollow_join = _fallback_join
-        logger.info("Auto-follow wiring installed via adapter-only fallback")
-
     async def _voice_join_handler(self, channel, text_channel_id: int):
         """Delegate an auto-follow join to the runner wiring installed by run_voice.py."""
         handler = getattr(self, "_voice_autofollow_join", None)
@@ -3559,10 +3552,6 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             # Stale runner module (int/str guild-id mismatch) — name it, don't hide it.
             logger.warning("Auto-follow join handler TypeError: %s", e, exc_info=True)
             return None
-
-    def _remember_auto_follow_binding(self, guild_id: int, text_channel_id: int) -> None:
-        """Track the text channel an authorized user last spoke in, for auto-follow joins."""
-        self._voice_auto_follow_bound[guild_id] = text_channel_id
 
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
@@ -3813,25 +3802,16 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
-        logger.info(
-            "join_voice_channel: vc=%s guild=%s existing=%s connected=%s",
-            getattr(channel, "name", channel), guild_id,
-            guild_id in self._voice_clients,
-            bool(self._voice_clients.get(guild_id) and self._voice_clients[guild_id].is_connected()))
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
-                logger.info(
-                    "join_voice_channel fast-path: already in %s (target %s, receiver=%s)",
-                    getattr(existing.channel, "name", "?"),
-                    getattr(channel, "name", "?"), guild_id in self._voice_receivers)
                 if existing.channel.id != channel.id:
                     await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
                 # Recovery: a connection can exist without a live receiver (an earlier
                 # join whose receiver start raised) — that state is deaf, so rebuild it.
-                if guild_id not in self._voice_receivers or guild_id not in self._voice_listen_tasks:
+                if guild_id not in self._voice_receivers:
                     logger.warning(
                         "Voice join found a connection with no live receiver (guild=%s); rebuilding",
                         guild_id)
@@ -3922,6 +3902,9 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            # End of the voice conversation session: the next join/first utterance opens a new
+            # thread rather than resurrecting this one.
+            getattr(self, "_voice_session_threads", {}).pop(guild_id, None)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
@@ -4088,7 +4071,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         # Follow-me presence: while any followed user is still in the voice channel,
         # staying connected is the whole point — never time them out from under us.
         if any(ch == getattr(getattr(self._voice_clients.get(guild_id), "channel", None), "id", None)
-               for ch in self._voice_following.values()):
+               for ch in getattr(self, "_voice_following", {}).values()):
             self._reset_voice_timeout(guild_id)
             return
         await self.leave_voice_channel(guild_id)
@@ -4182,6 +4165,19 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
                 logger.info("Dropping voice input from user %d: binding moved during transcription", user_id)
                 return
+            # One thread per voice conversation session: the first utterance opens it and the
+            # binding moves there, so the whole spoken conversation (echo, replies, follow-up
+            # turns) lives together instead of in the channel stream. On failure, stay inline.
+            if transcript and captured_for is not None:
+                thread = await self._voice_session_thread(guild_id, captured_for, transcript)
+                if thread is not None and int(thread.id) != int(captured_for):
+                    self._voice_text_channels[guild_id] = int(thread.id)
+                    # The join stored a source for the parent channel; keep it and the runner
+                    # would route thread turns back into the parent's session. Drop it so the
+                    # runner rebuilds one from the thread (thread_id + parent_chat_id).
+                    if hasattr(self, "_voice_sources"):
+                        self._voice_sources.pop(guild_id, None)
+                    captured_for = int(thread.id)
             if self._voice_input_callback:
                 await self._voice_input_callback(
                     guild_id=guild_id, user_id=user_id, transcript=transcript,
